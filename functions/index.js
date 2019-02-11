@@ -32,6 +32,10 @@ const validateFirebaseIdToken = (req, res) => {
     })
 };
 
+/**
+ * Order is created by passing in the userID to the create order function
+ * @type {HttpsFunction}
+ */
 exports.placeCaseOrder = functions.https.onRequest((req, res) => {
     if ('OPTIONS' == req.method && req.body == null) {
         res.status(204).send('Preflight was good');
@@ -59,40 +63,64 @@ exports.placeCaseOrder = functions.https.onRequest((req, res) => {
 });
 
 /**
- * Anytime a new user is added to a case queue, check if the case in question is available. If it is, take the first
- * user from the queue and push every user up one.
+ * Anytime the status of a case changes to available, check the caseQueue to see if any user currently needs the device
+ * If a user needs the device, then complete the order for that user. After that, push the queue up one by transaction
+ * TODO: Send notification of the order been completed
  * @type {CloudFunction<Change<DataSnapshot>>}
  */
+exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').onUpdate(async (snapshot, context) => {
+    const isCaseAvailable = snapshot.after.val();
+    const caseId = context.params['caseId'];
+
+    // If the case is available and there is queue data
+    // , work with the queue data object
+    if (!isCaseAvailable) return;
+
+    // Get the queue ref
+    const queue = (await db.ref(`caseQueue/${caseId}/queue`).once('value')).val();
+
+    // If there is a property of 1 in the queue, there is a user in line
+    if (!queue.hasOwnProperty(1)) return;
+
+    const userId = queue[1];
+    completeOrder(userId, caseId)
+        .then(() => {
+            return db.ref(`caseQueue/${caseId}/queue`).transaction(queueData => {
+                if (!queueData) return queueData;
+
+                const queueLength = Object.keys(queueData).length;
+                for (let i = 1; i < queueLength; i++) {
+                    queueData[i] = queueData[i+1];
+                }
+                // Remove the last entry in the queue since queue has been pushed up
+                delete queueData[queueLength];
+                return queueData;
+            });
+        });
+});
+
 exports.processCaseOrder = functions.database.ref('caseQueues/{caseId}/queue').onUpdate(async (snapshot, context) => {
     const data = snapshot.after.val();
     const caseId = context.params['caseId'];
-    const parentRef =
 
     // Get if the case is available
     const isCaseAvailable = (await db.ref(`cases/${caseId}/isAvailable`).once('value')).val();
 
-    // If the case is available and there is queue data
-    // , work with the queue data object
+    // If the case is available, work with the queue data object
     if (isCaseAvailable && data) {
 
-        if (!data.hasOwnProperty(1)) return;
+        for (const index in data) {
+            if (!data.hasOwnProperty(index)) break;
 
-        const userId = data[1];
-        completeOrder(userId, caseId)
-            .then(() => {
-                for (let i = 1; i < Object.keys(data).length; i++) {
-                    data[i] = data[i+1];
-                }
-            })
-
+            const userId = data[index];
+        }
     }
 });
 
 
 /**
- * This function creates an order for each case in a user's cart. If the case is presently available and there is
- * no queue for the case, immediately process the user's order. If the case has a line for it or it is unavailable,
- * create a queue and add the user to the bottom of the queue. First In First Out.
+ * This function creates an order for each case in a user's cart. The function adds each of the cases into the
+ * queues for each of the cases.
  * @param uid
  * @returns {Promise<admin.database.DataSnapshot | null>}
  */
@@ -104,55 +132,24 @@ function createOrder(uid) {
         .then(snapshot => {
             if (!snapshot.exists()) return null;
 
-            // For each of the case ID, do the required checks to determine how to get the user the case.
-            snapshot.forEach(async snap => {
-                const isCaseAvailable = (await db.ref(`cases/${snap.key}/isAvailable`).once('value')).val();
-
-                // If the case is available, complete the order for user without need for a queue.
-                if (isCaseAvailable) {
-                    return completeOrder(uid, snap.key);
-                }
-
-                queueUserOrder(uid, snap.key);
+            // For each of the case ID, queue the order into the appropriate case queue and return a boolean value
+            snapshot.forEach(snap => {
+                return !!queueUserOrder(uid, snap.key);
             });
         });
 }
 
 /**
- * This function is triggered when the order has been completed. The order hasn't necessarily been fulfilled but it
- * should be on its way there.
+ * Queue the user based on their userID into the caseQueue by using FIFO method. When a new transaction is created,
+ * check if the case is available, if it is, complete the order of the first user. Then push the log of the order
+ * been created to the appropriate field then remove the case from the user's cart.
  * @param uid
  * @param caseId
+ * @returns {Promise<void | never>}
  */
-function completeOrder(uid, caseId) {
-    const orderRef = db.ref(`completeOrders/${caseId}`);
-    const pastOrderRef = db.ref(`userPastOrders/${uid}`);
-    const caseRef = db.ref(`cases/${caseId}`);
-    const userHistory = db.ref(`userHistory/${uid}`);
-    const timestamp = admin.database.ServerValue.TIMESTAMP;
-
-    // Add to complete order table, user's past orders and update the case availability.
-    return orderRef.push({
-        user: uid,
-        timestamp: timestamp
-    }).then(() => {
-        return pastOrderRef.push({
-            case: caseId,
-            timestamp: timestamp
-        })
-    }).then(() => caseRef.child('isAvailable').update(false))
-        .then(() => {
-            return userHistory.push({
-                timestamp: timestamp,
-                info: 'Order placed',
-                caseId: caseId
-            });
-        });
-}
-
 function queueUserOrder(uid, caseId) {
     const userHistory = db.ref(`userHistory/${uid}`);
-    const cartRef = db.ref(`userCarts/${uid}`);
+    const cartRef = db.ref(`userCarts/${uid}/${caseId}`);
 
     // A nice way to always ensure that there are no duplicate or out of order orders.
     return db.ref(`caseQueues/${caseId}`).transaction(caseData => {
@@ -188,4 +185,35 @@ function queueUserOrder(uid, caseId) {
     });
 }
 
-// TODO When a case is available, check the case's queue for if someone wants the device
+/**
+ * This function is triggered when the order has been completed. The order hasn't necessarily been fulfilled but it
+ * should be on its way to fulfillment.
+ * @param uid
+ * @param caseId
+ */
+function completeOrder(uid, caseId) {
+    const orderRef = db.ref(`completeOrders/${caseId}`);
+    const pastOrderRef = db.ref(`userPastOrders/${uid}`);
+    const caseRef = db.ref(`cases/${caseId}`);
+    const userHistory = db.ref(`userHistory/${uid}`);
+    const timestamp = admin.database.ServerValue.TIMESTAMP;
+
+    // Add to complete order table, user's past orders and update the case availability.
+    return orderRef.push({
+        user: uid,
+        timestamp: timestamp,
+        scanned: false
+    }).then(() => {
+        return pastOrderRef.push({
+            case: caseId,
+            timestamp: timestamp
+        });
+    }).then(() => caseRef.child('isAvailable').update(false))
+        .then(() => {
+            return userHistory.push({
+                timestamp: timestamp,
+                info: 'Order placed',
+                caseId: caseId
+            });
+        });
+}
