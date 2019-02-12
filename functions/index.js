@@ -85,12 +85,13 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
     const userId = queue[1];
     completeOrder(userId, caseId)
         .then(() => {
+            // Remove the first user in the queue and move the queue up then set the userId to first user
             return db.ref(`caseQueue/${caseId}/queue`).transaction(queueData => {
                 if (!queueData) return queueData;
 
                 const queueLength = Object.keys(queueData).length;
                 for (let i = 1; i < queueLength; i++) {
-                    queueData[i] = queueData[i+1];
+                    queueData[i] = queueData[i + 1];
                 }
                 // Remove the last entry in the queue since queue has been pushed up
                 delete queueData[queueLength];
@@ -99,22 +100,47 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
         });
 });
 
-exports.processCaseOrder = functions.database.ref('caseQueues/{caseId}/queue').onUpdate(async (snapshot, context) => {
-    const data = snapshot.after.val();
+/**
+ * When a user is added to the caseQueue, check if the case isAvailable. If it is, push the caseId and userId to the
+ * kartQueue.
+ * @type {CloudFunction<DataSnapshot>}
+ */
+exports.processCaseOrder = functions.database.ref('caseQueues/{caseId}/queue').onCreate(async (snapshot, context) => {
+    const queueRef = snapshot.ref.parent;
     const caseId = context.params['caseId'];
+    const kartQueueRef = db.ref(`kartQueue`);
+    let nextUserId = null;
 
     // Get if the case is available
     const isCaseAvailable = (await db.ref(`cases/${caseId}/isAvailable`).once('value')).val();
 
-    // If the case is available, work with the queue data object
-    if (isCaseAvailable && data) {
+    // If the case is not available, stop here
+    if (!isCaseAvailable) return;
 
-        for (const index in data) {
-            if (!data.hasOwnProperty(index)) break;
+    // Remove the first user in the queue and move the queue up then set the userId to first user
+    return queueRef.transaction(queueData => {
+        if (!queueData) return queueData;
 
-            const userId = data[index];
+        const queueLength = Object.keys(queueData.queue).length;
+        if (queueLength > 0 && !nextUserId) {
+            nextUserId = queueData.queue[1];
         }
-    }
+        for (let i = 1; i < queueLength; i++) {
+            queueData.queue[i] = queueData.queue[i + 1];
+        }
+        // Remove the last entry in the queue since queue has been pushed up
+        delete queueData.queue[queueLength];
+        queueData.queueCount--;
+        return queueData;
+    }).then(txData => {
+        if (!txData.committed) throw new Error('Unable to move queue');
+
+        // After moving the queue up, add the nextUserId and the caseId to the kartQueue
+        return kartQueueRef.push({
+            userId: nextUserId,
+            caseId: caseId
+        });
+    });
 });
 
 
@@ -164,11 +190,12 @@ function queueUserOrder(uid, caseId) {
         return caseData;
     }).then(txData => {
         if (!txData.committed) throw new Error('Unable to add cases to queue.');
-        const snap = txData.snapshot.val();
+        const snap = txData.snapshot;
         let info = 'Order Created! ';
+        const queueID = snap.val().queue.uid;
 
-        if (snap.queue.uid > 1) {
-            info += `You are #${snap.queue.uid} in the queue`;
+        if (queueID > 1) {
+            info += `You are #${queueID} in the queue`;
         } else {
             info += `Your order has been processed.`;
         }
