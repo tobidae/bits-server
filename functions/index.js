@@ -1,8 +1,6 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-var corsModule = require('cors');
-
-const cors = corsModule({
+const cors = require('cors')({
     origin: true
 });
 
@@ -37,28 +35,32 @@ const validateFirebaseIdToken = (req, res) => {
  * @type {HttpsFunction}
  */
 exports.placeCaseOrder = functions.https.onRequest((req, res) => {
-    if ('OPTIONS' == req.method && req.body == null) {
-        res.status(204).send('Preflight was good');
-    }
     cors(req, res, () => {
-        validateFirebaseIdToken(req, res)
-            .then(user => {
-                let userId = user['uid'];
-                // let bodyData = req.body;
+        if (req.method === 'OPTIONS' && req.body == null) {
+            res.status(204).send('Preflight was good');
+        }
+        validateFirebaseIdToken(req, res).then(user => {
+            let userId = user['uid'];
+            // let bodyData = req.body;
 
-                createOrder(userId).then(() => {
-                    res.status(200).send({
-                        type: 'success',
-                        message: 'Added order to queue'
-                    })
-                }).catch(error => {
-                    console.log(error);
-                    res.status(400).send({
-                        type: 'error',
-                        message: error
-                    });
+            createOrder(userId).then(() => {
+                res.status(200).send({
+                    type: 'success',
+                    message: 'Added order to queue'
+                })
+            }).catch(error => {
+                console.log(error);
+                res.status(400).send({
+                    type: 'error',
+                    message: error
                 });
             });
+        }).catch(error => {
+            res.status(401).send({
+                type: 'error',
+                message: error
+            })
+        });
     });
 });
 
@@ -72,12 +74,11 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
     const isCaseAvailable = snapshot.after.val();
     const caseId = context.params['caseId'];
 
-    // If the case is available and there is queue data
-    // , work with the queue data object
+    // If the case is available and there is queue data, work with the queue data object
     if (!isCaseAvailable) return;
 
     // Get the queue ref
-    const queue = (await db.ref(`caseQueue/${caseId}/queue`).once('value')).val();
+    const queue = (await db.ref(`caseQueues/${caseId}/queue`).once('value')).val();
 
     // If there is a property of 1 in the queue, there is a user in line
     if (!queue.hasOwnProperty(1)) return;
@@ -86,7 +87,7 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
     completeOrder(userId, caseId)
         .then(() => {
             // Remove the first user in the queue and move the queue up then set the userId to first user
-            return db.ref(`caseQueue/${caseId}/queue`).transaction(queueData => {
+            return db.ref(`caseQueues/${caseId}/queue`).transaction(queueData => {
                 if (!queueData) return queueData;
 
                 const queueLength = Object.keys(queueData).length;
@@ -95,6 +96,7 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
                 }
                 // Remove the last entry in the queue since queue has been pushed up
                 delete queueData[queueLength];
+                console.log(queueData);
                 return queueData;
             });
         });
@@ -160,7 +162,7 @@ function createOrder(uid) {
 
             // For each of the case ID, queue the order into the appropriate case queue and return a boolean value
             snapshot.forEach(snap => {
-                return !!queueUserOrder(uid, snap.key);
+                !!queueUserOrder(uid, snap.key);
             });
         });
 }
@@ -174,8 +176,11 @@ function createOrder(uid) {
  * @returns {Promise<void | never>}
  */
 function queueUserOrder(uid, caseId) {
-    const userHistory = db.ref(`userHistory/${uid}`);
+    const pushKey = db.ref().push().key;
+    const userHistory = db.ref(`userHistory/${uid}/${pushKey}`);
+    const pastOrderRef = db.ref(`userPastOrders/${uid}/${pushKey}`);
     const cartRef = db.ref(`userCarts/${uid}/${caseId}`);
+    const timestamp = admin.database.ServerValue.TIMESTAMP;
 
     // A nice way to always ensure that there are no duplicate or out of order orders.
     return db.ref(`caseQueues/${caseId}`).transaction(caseData => {
@@ -200,10 +205,16 @@ function queueUserOrder(uid, caseId) {
             info += `Your order has been processed.`;
         }
 
-        return userHistory.push({
+        return userHistory.set({
             timestamp: admin.database.ServerValue.TIMESTAMP,
             info: info,
-            caseId: snap.key
+            caseId: caseId
+        });
+    }).then(() => {
+        return pastOrderRef.set({
+            case: caseId,
+            timestamp: timestamp,
+            completed: false
         });
     }).then(() => {
         return cartRef.remove();
@@ -219,27 +230,31 @@ function queueUserOrder(uid, caseId) {
  * @param caseId
  */
 function completeOrder(uid, caseId) {
-    const orderRef = db.ref(`completeOrders/${caseId}`);
-    const pastOrderRef = db.ref(`userPastOrders/${uid}`);
+    const pushKey = db.ref().push().key;
+    const orderRef = db.ref(`completeOrders/${caseId}/${pushKey}`);
+    const pastOrderRef = db.ref(`userPastOrders/${uid}/${pushKey}`);
     const caseRef = db.ref(`cases/${caseId}`);
-    const userHistory = db.ref(`userHistory/${uid}`);
+    const userHistory = db.ref(`userHistory/${uid}/${pushKey}`);
     const timestamp = admin.database.ServerValue.TIMESTAMP;
 
     // Add to complete order table, user's past orders and update the case availability.
-    return orderRef.push({
+    return orderRef.set({
         user: uid,
         timestamp: timestamp,
         scanned: false
-    }).then(() => {
-        return pastOrderRef.push({
-            case: caseId,
-            timestamp: timestamp
-        });
-    }).then(() => caseRef.child('isAvailable').update(false))
+    })
         .then(() => {
-            return userHistory.push({
+            return pastOrderRef.update({
+                case: caseId,
                 timestamp: timestamp,
-                info: 'Order placed',
+                completed: true
+            });
+        })
+        .then(() => caseRef.child('isAvailable').update(false))
+        .then(() => {
+            return userHistory.set({
+                timestamp: timestamp,
+                info: 'Order completed!',
                 caseId: caseId
             });
         });
