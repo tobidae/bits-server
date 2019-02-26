@@ -3,6 +3,11 @@ const admin = require('firebase-admin');
 const cors = require('cors')({
     origin: true
 });
+const factorySectors = {
+    'A1': {x: 0, y: 0}, 'A2': {x: 1, y: 0}, 'A3': {x: 2, y: 0},
+    'B1': {x: 0, y: 1}, 'B2': {x: 1, y: 1}, 'B3': {x: 2, y: 1},
+    'C1': {x: 0, y: 2}, 'C2': {x: 1, y: 2}, 'C3': {x: 2, y: 2}
+};
 
 admin.initializeApp();
 const db = admin.database();
@@ -84,21 +89,12 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
     if (!queue.hasOwnProperty(1)) return;
 
     const userId = queue[1];
-    completeOrder(userId, caseId)
+    return completeOrder(userId, caseId)
         .then(() => {
-            // Remove the first user in the queue and move the queue up then set the userId to first user
-            return db.ref(`caseQueues/${caseId}/queue`).transaction(queueData => {
-                if (!queueData) return queueData;
-
-                const queueLength = Object.keys(queueData).length;
-                for (let i = 1; i < queueLength; i++) {
-                    queueData[i] = queueData[i + 1];
-                }
-                // Remove the last entry in the queue since queue has been pushed up
-                delete queueData[queueLength];
-                console.log(queueData);
-                return queueData;
-            });
+            return sendOrderToKart(db.ref(`caseQueues/${caseId}`), caseId);
+        })
+        .catch(error => {
+            console.error('Check Case Stat', error);
         });
 });
 
@@ -110,8 +106,6 @@ exports.checkCaseStatus = functions.database.ref('cases/{caseId}/isAvailable').o
 exports.processCaseOrder = functions.database.ref('caseQueues/{caseId}/queue').onCreate(async (snapshot, context) => {
     const queueRef = snapshot.ref.parent;
     const caseId = context.params['caseId'];
-    const kartQueueRef = db.ref(`kartQueue`);
-    let nextUserId = null;
 
     // Get if the case is available
     const isCaseAvailable = (await db.ref(`cases/${caseId}/isAvailable`).once('value')).val();
@@ -119,30 +113,22 @@ exports.processCaseOrder = functions.database.ref('caseQueues/{caseId}/queue').o
     // If the case is not available, stop here
     if (!isCaseAvailable) return;
 
-    // Remove the first user in the queue and move the queue up then set the userId to first user
-    return queueRef.transaction(queueData => {
-        if (!queueData) return queueData;
+    const queue = snapshot.val();
+    if (!queue.hasOwnProperty(1)) return;
 
-        const queueLength = Object.keys(queueData.queue).length;
-        if (queueLength > 0 && !nextUserId) {
-            nextUserId = queueData.queue[1];
-        }
-        for (let i = 1; i < queueLength; i++) {
-            queueData.queue[i] = queueData.queue[i + 1];
-        }
-        // Remove the last entry in the queue since queue has been pushed up
-        delete queueData.queue[queueLength];
-        queueData.queueCount--;
-        return queueData;
-    }).then(txData => {
-        if (!txData.committed) throw new Error('Unable to move queue');
+    const userId = queue[1];
 
-        // After moving the queue up, add the nextUserId and the caseId to the kartQueue
-        return kartQueueRef.push({
-            userId: nextUserId,
-            caseId: caseId
+    return completeOrder(userId, caseId)
+        .then(() => {
+            return sendOrderToKart(queueRef, caseId);
+        })
+        .catch(error => {
+            console.error('Process Case Order', error);
         });
-    });
+});
+
+exports.processKartQueue = functions.database.ref('kartQueue/{kartId}').onCreate(async (snapshot, context) => {
+
 });
 
 
@@ -231,31 +217,124 @@ function queueUserOrder(uid, caseId) {
  */
 function completeOrder(uid, caseId) {
     const pushKey = db.ref().push().key;
-    const orderRef = db.ref(`completeOrders/${caseId}/${pushKey}`);
+    const completeOrderRef = db.ref(`completeOrders/${caseId}/${pushKey}`);
     const pastOrderRef = db.ref(`userPastOrders/${uid}/${pushKey}`);
     const caseRef = db.ref(`cases/${caseId}`);
     const userHistory = db.ref(`userHistory/${uid}/${pushKey}`);
     const timestamp = admin.database.ServerValue.TIMESTAMP;
 
     // Add to complete order table, user's past orders and update the case availability.
-    return orderRef.set({
+    return completeOrderRef.set({
         user: uid,
         timestamp: timestamp,
         scanned: false
     })
-        .then(() => {
-            return pastOrderRef.update({
-                case: caseId,
-                timestamp: timestamp,
-                completed: true
-            });
-        })
-        .then(() => caseRef.child('isAvailable').update(false))
-        .then(() => {
-            return userHistory.set({
-                timestamp: timestamp,
-                info: 'Order completed!',
-                caseId: caseId
-            });
+        .then(() => pastOrderRef.update({
+            case: caseId,
+            timestamp: timestamp,
+            completed: false
+        }))
+        .then(() => caseRef.update({
+            isAvailable: false
+        }))
+        .then(() => userHistory.set({
+            timestamp: timestamp,
+            info: 'Your order has been completed!',
+            caseId: caseId
+        }))
+        .catch(error => {
+            console.error('Complete Order', error);
         });
+}
+
+/**
+ * Get the user and caseId and determine the closest kart to the lastLocation of the case. If the case is not close to
+ * kart, get the next closest kart and send the order to the kart. The snippet sent includes the userId and caseId
+ * @param queueRef
+ * @param caseId
+ * @returns {Promise<T>}
+ */
+function sendOrderToKart(queueRef, caseId) {
+    let nextUserId = null;
+    const kartQueueRef = db.ref(`kartQueues`);
+    const kartInfoRef = db.ref(`kartInfo`);
+    const caseInfoRef = db.ref(`cases/${caseId}`);
+    const userHistory = db.ref(`userHistory/`);
+    const timestamp = admin.database.ServerValue.TIMESTAMP;
+
+    // Remove the first user in the queue and move the queue up then set the userId to first user
+    return queueRef.transaction(queueData => {
+        if (!queueData) return queueData;
+
+        const queueLength = Object.keys(queueData.queue).length;
+        if (queueLength > 0 && !nextUserId) {
+            nextUserId = queueData.queue[1].userId;
+        }
+        for (let i = 1; i < queueLength; i++) {
+            queueData.queue[i] = queueData.queue[i + 1];
+        }
+        // Remove the last entry in the queue since queue has been pushed up
+        delete queueData.queue[queueLength];
+        queueData.queueCount--;
+        return queueData;
+    }).then(async txData => {
+        if (!txData.committed) throw new Error('Unable to move queue');
+
+        // Get the last location of a case
+        const caseLastLocation = (await caseInfoRef.child('lastLocation').once('value')).val();
+        // Order the karts in descending order from A1 to C3
+        const orderedKartRef = kartInfoRef.orderByChild('currentLocation');
+        let bestKart = null;
+
+        // check if the kart is in the same location as the case
+        let currentKartLoc = (await orderedKartRef.equalTo(caseLastLocation).once('value')).val();
+        console.log('Kart at location', currentKartLoc);
+
+        // If there is no kart at to the case location, check for next closest
+        if (!currentKartLoc) {
+            let shortestDistance = Number.MAX_SAFE_INTEGER; // Default to Max Integer
+            const allKarts = (await orderedKartRef.once('value'));
+            allKarts.forEach(kartSnap => {
+                const kartLoc = kartSnap.val()['currentLocation'];
+                const curDist = shortestGridDist(currentKartLoc, kartLoc);
+                // If the distance of the kart is less than the most recent short distance
+                // Save the kart as the best kart and continue
+                // Maybe for optimization, if the curDist is 1, then it's in the shortest possible dist
+                if (curDist < shortestDistance) {
+                    bestKart = kartSnap.key;
+                    shortestDistance = curDist;
+                }
+            });
+        } else {
+            bestKart = currentKartLoc['currentLocation'];
+        }
+        console.log('Best Kart: ', bestKart);
+        // After moving the queue up, add the nextUserId and the caseId to the kartQueue
+        return kartQueueRef.child(bestKart).push({
+            userId: nextUserId,
+            caseId: caseId
+        });
+    }).then(() => {
+        if (!nextUserId) return;
+        return userHistory.child(nextUserId).push({
+            case: caseId,
+            timestamp: timestamp,
+            info: 'Your order has been sent to a kart for processing'
+        });
+    });
+}
+
+/**
+ * Calculate the distance between two coordinate points using the quadratic formula
+ * @param a
+ * @param b
+ * @returns {string}
+ */
+function shortestGridDist(a, b) {
+    const x1 = a.x;
+    const x2 = b.x;
+    const y1 = a.y;
+    const y2 = b.y;
+    const dis = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+    return dis.toFixed(2);
 }
