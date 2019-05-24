@@ -332,7 +332,7 @@ async function sendOrderToKart(queueRef, caseId, pushKey, pickupLocation) {
         if (!bestKart) throw new Error('Karts are not available at this time.');
 
         // After moving the queue up, add the nextUserId and the caseId to the kartQueue
-        return kartQueueRef.child(bestKart).push({
+        return kartQueueRef.child(bestKart).child(pushKey).set({
             userId: nextUserId,
             caseId: caseId,
             pushKey: pushKey,
